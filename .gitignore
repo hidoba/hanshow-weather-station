@@ -1,0 +1,13 @@
+# build output
+.pio/
+firmware/tag/out/
+# fetched by firmware/tag/get_sdk.sh (Telink SDK + tc32 toolchain, ~80 MB)
+firmware/tag/components/
+firmware/tag/tc32_linux/
+firmware/tag/make/
+firmware/tag/static_src/
+# local config / generated
+firmware/esp32/src/secrets.h
+firmware/esp32/src/tag_firmware.h
+.venv/
+__pycache__/
