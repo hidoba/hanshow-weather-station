@@ -5,16 +5,19 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
+String air_status = "-";
+static String last_http_error;
+
 static bool get_json(const String &url, JsonDocument &doc) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.begin(client, url);
   int rc = http.GET();
-  if (rc != 200) { logf("http %d: %s\n", rc, url.c_str()); http.end(); return false; }
+  if (rc != 200) { logf("http %d: %s\n", rc, url.c_str()); last_http_error = "http " + String(rc); http.end(); return false; }
   DeserializationError e = deserializeJson(doc, http.getString());
   http.end();
-  if (e) { logf("json %s: %s\n", e.c_str(), url.c_str()); return false; }
+  if (e) { logf("json %s: %s\n", e.c_str(), url.c_str()); last_http_error = String("json ") + e.c_str(); return false; }
   return true;
 }
 
@@ -50,7 +53,8 @@ bool fetch_air(float lat, float lon, Weather &w) {
   JsonDocument doc;
   w.pm25 = NAN;
   w.eaqi = -1;
-  if (!get_json(url, doc)) return false;
+  if (!get_json(url, doc)) { air_status = last_http_error; return false; }
+  air_status = "ok";
   if (!doc["current"]["pm2_5"].isNull()) w.pm25 = doc["current"]["pm2_5"];
   w.eaqi = doc["current"]["european_aqi"] | -1;
   logf("air: pm2.5 %.1f eaqi %d\n", w.pm25, w.eaqi);

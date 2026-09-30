@@ -4,6 +4,7 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include "app.h"
 #include "config.h"
 #include "holidays.h"
@@ -74,6 +75,7 @@ td{padding:2px 12px 2px 0}
 <label>Weather update / full refresh (minutes)</label><input type="number" name="wmin" min="1" max="120" value="%WMIN%">
 <label>Units</label><select name="units"><option value="c" %UNITC%>&deg;C, km/h</option><option value="f" %UNITF%>&deg;F, mph</option></select>
 <label><input type="checkbox" name="clock" %CLOCK%> Show clock (fast refresh every minute)</label>
+<label><input type="checkbox" name="psave" %PSAVE%> Power saving: deep sleep when this page hasn't been opened for 5 minutes (the clock and weather keep updating; press BOOT on the ESP32 or power-cycle it to reach this page again)</label>
 <label><input type="checkbox" name="holidays" %HOLIDAYS%> Holidays: an illustration instead of the temperature curve on special days</label>
 <label>Birthdays (shown on the day, before any other holiday)</label>
 %BIRTHDAYS%
@@ -153,11 +155,19 @@ static String status_rows() {
     row("LED", sun);
   }
   row("IP", WiFi.localIP().toString());
+  app_lock();
+  bool ps = settings.power_save;
+  app_unlock();
+  long left = (long)AWAKE_WINDOW_S - (long)((millis() - awake_since) / 1000);
+  row("Power", !ps ? String("always on") :
+                     "deep sleep in " + String(max(0L, left) / 60) + ":" + (max(0L, left) % 60 < 10 ? "0" : "") +
+                     String(max(0L, left) % 60) + " (reload the page to stay awake; afterwards press BOOT or power-cycle)");
   if (st.last_error.length()) row("Error", "<span class=err>" + esc(st.last_error) + "</span>");
   return rows;
 }
 
 static void handle_root() {
+  awake_since = millis();  // opening the page keeps the ESP32 awake (the page's own polling doesn't)
   app_lock();
   Settings s = settings;
   Status st = status;
@@ -172,6 +182,7 @@ static void handle_root() {
   page.replace("%WMIN%", String(s.weather_minutes));
   page.replace("%CLOCK%", s.clock ? "checked" : "");
   page.replace("%HOLIDAYS%", s.holidays ? "checked" : "");
+  page.replace("%PSAVE%", s.power_save ? "checked" : "");
   page.replace("%SETTINGSMSG%", st.settings_msg.length() ? "<div class=err>" + esc(st.settings_msg) + "</div>" : String(""));
   static const char *MON[] = {"-", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   String bd;
@@ -211,6 +222,7 @@ static void esp32_upload() {
     upload_error = "";
     if (!authorized()) { upload_error = "unauthorized"; return; }
     logf("ota: esp32 upload %s\n", u.filename.c_str());
+    esp_wifi_set_ps(WIFI_PS_NONE);  // full speed for the transfer (restored by the reboot)
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) upload_error = Update.errorString();
     else post_message({"Receiving new firmware", "for the ESP32...", "don't unplug"}, 600);
   } else if (u.status == UPLOAD_FILE_WRITE) {
@@ -314,6 +326,7 @@ static void handle_save() {
   settings.weather_minutes = wmin;
   settings.clock = clock;
   settings.holidays = server.hasArg("holidays");
+  settings.power_save = server.hasArg("psave");
   String bad_dates;
   for (int i = 0; i < MAX_BIRTHDAYS; i++) {
     String n = server.arg("bn" + String(i));

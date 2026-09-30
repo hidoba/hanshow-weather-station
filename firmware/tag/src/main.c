@@ -25,14 +25,16 @@
 #include "epd.h"
 #include "ota.h"
 
-#define FW_VERSION "10"
+#define FW_VERSION "12"
 #define MAX_PAYLOAD 600
+#define IDLE_SLEEP_MS 300 // suspend after this long without serial traffic
 #ifndef BOOT_REFRESH
 #define BOOT_REFRESH 0
 #endif
 
 static uint8_t panel_ok;
 static int refresh_count; // lets the host notice a reboot (planes lost)
+static int sleep_count;   // times the tag suspended (diagnostics)
 static uint8_t rx_idx, tx_idx;
 
 _attribute_ram_code_ void irq_handler(void)
@@ -176,6 +178,8 @@ static void handle(uint8_t cmd, uint8_t *p, int len)
         uart_putdec(ota_running_bank() ? 1 : 0);
         uart_puts(" n=");
         uart_putdec(refresh_count);
+        uart_puts(" s=");
+        uart_putdec(sleep_count);
         uart_putc('\n');
         break;
     case 'F':
@@ -234,10 +238,25 @@ static void handle(uint8_t cmd, uint8_t *p, int len)
     }
 }
 
+// Suspend (RAM and panel state kept, ~1000x less current) until RXD or SWS goes low. The host
+// sends a wake-up pulse before its first frame; bytes arriving during the wake-up are dropped.
+static void tag_sleep(void)
+{
+    wd_stop(); // the watchdog would reset a sleeping tag
+    sleep_count++;
+    cpu_set_gpio_wakeup(RXD, Level_Low, 1);
+    cpu_set_gpio_wakeup(GPIO_PA7, Level_Low, 1);
+    cpu_sleep_wakeup(SUSPEND_MODE, PM_WAKEUP_PAD, 0);
+    wd_clear();
+    wd_start();
+    uart_recover(); // discard the wake-up pulse
+}
+
 static uint8_t buf[MAX_PAYLOAD + 8];
 
 _attribute_ram_code_ int main(void)
 {
+    blc_pm_select_internal_32k_crystal(); // sleep timing source (no 32k crystal on the tag)
     cpu_wakeup_init();
     u32 boot_tick = clock_time();
     gpio_init(1);
@@ -288,6 +307,10 @@ _attribute_ram_code_ int main(void)
                 state = 0; // inter-byte timeout, drop partial frame
                 uart_recover();
             }
+            if (!state && clock_time_exceed(last, IDLE_SLEEP_MS * 1000) && !SWS_LOW()) {
+                tag_sleep();
+                last = clock_time();
+            }
             continue;
         }
         last = clock_time();
@@ -310,6 +333,7 @@ _attribute_ram_code_ int main(void)
                 else
                     handle(buf[0], buf + 3, pos - 5);
                 state = 0;
+                last = clock_time(); // stay awake a while after a command (refreshes take long)
             }
             break;
         }

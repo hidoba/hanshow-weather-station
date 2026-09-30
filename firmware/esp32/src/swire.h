@@ -5,6 +5,7 @@
 #include <Arduino.h>
 
 void swire_begin();                  // idle: SWS held high, NRST released
+void swire_prepare_sleep();          // keep NRST released and SWS high through deep sleep
 void tag_hard_reset();               // pulse NRST
 bool swire_halt_cpu();               // reset + stop the CPU during boot; SWS stays attached
 void swire_release();                // soft-reset the halted CPU and return SWS to idle

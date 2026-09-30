@@ -38,6 +38,16 @@ public:
   }
 };
 
+// What the ESP32 knows about the tag's framebuffer; small enough to keep in RTC memory across
+// deep sleep (per-chunk checksums instead of a copy of the planes).
+struct TagState {
+  static const int CHUNKS = (EpdCanvas::PLANE + 239) / 240;
+  uint16_t crc[2][CHUNKS];
+  bool valid;      // crc[] describes what the tag holds
+  int expect_n;    // tag refresh count after our last refresh (a mismatch means it rebooted)
+  uint16_t hard_resets;  // NRST resets because the tag didn't answer (diagnostics)
+};
+
 class Tag {
 public:
   explicit Tag(HardwareSerial &s) : s_(s) { mtx_ = xSemaphoreCreateMutex(); }
@@ -47,7 +57,11 @@ public:
   // full = flashing 3-color refresh (~13 s), fast = black/white-only update (~1 s).
   // led = brightness of the tag's LED while it refreshes, in 0.1 % units (0..1000).
   // force_fast: use the fast refresh even if the tag's screen content is unknown (after boot).
-  bool show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast = false);
+  // wait = false: return right after starting the refresh (the tag finishes on its own; the next
+  // call checks its refresh count). Used before deep sleep.
+  bool show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast = false, bool wait = true);
+  TagState state() const { return st_; }
+  void set_state(const TagState &s) { st_ = s; }
   // Light a tag LED without refreshing: level in 0.1 % units, red = red LED instead of green.
   bool led(uint16_t level, uint16_t ms, bool red = false);
   // Flash new tag firmware (a Telink .bin) over the UART link; the tag verifies the CRC,
@@ -59,9 +73,9 @@ public:
 private:
   String cmd(char c, const uint8_t *p, int n, uint32_t timeout_ms);
   HardwareSerial &s_;
-  uint8_t sent_[2][EpdCanvas::PLANE];  // what the tag holds, valid while its refresh count matches
-  bool sent_valid_ = false;
-  int expect_n_ = -1;
+  void wake();  // the tag sleeps when idle: a long low pulse on its RX wakes it
+  TagState st_ = {{}, false, -1};
+  uint32_t last_io_ = 0;  // millis() of the last exchange (0 = never: wake first)
   SemaphoreHandle_t mtx_;
   String info_;
 };

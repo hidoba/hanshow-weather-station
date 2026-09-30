@@ -7,6 +7,11 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include <Update.h>
+#include <WiFiUdp.h>
 #include <time.h>
 #include "app.h"
 #include "config.h"
@@ -14,6 +19,9 @@
 #include "secrets.h"
 #include "swire.h"
 #include "tag_firmware.h"
+
+// Weather fetches can run in setup() (deep-sleep wake-ups): TLS needs more than the default 8 KB.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 Settings settings;
 Status status;
@@ -24,6 +32,8 @@ uint8_t *volatile tag_fw = nullptr;
 volatile size_t tag_fw_len = 0;
 volatile bool tag_fw_sws = false;
 volatile int preview_holiday = -1;
+volatile uint32_t awake_since = 0;
+volatile bool ota_active = false;
 volatile int tag_action = TAG_NONE;
 
 static SemaphoreHandle_t mtx;
@@ -236,13 +246,198 @@ static bool fetch(Weather &w, String &place) {
   return true;
 }
 
+// Redraw the weather screen when needed: a full refresh was asked for, the minute or the holiday
+// changed. Returns 1 if drawn, 0 if nothing to do, -1 if the tag didn't take it.
+// wait = false starts the refresh and returns (before deep sleep).
+static uint32_t fnv1a(const String &s) {
+  uint32_t h = 2166136261u;
+  for (unsigned i = 0; i < s.length(); i++) h = (h ^ (uint8_t)s[i]) * 16777619u;
+  return h;
+}
+
+static int draw_weather(const Weather &wx, const String &place, Clock &clk, bool full, int &shown_minute,
+                        uint32_t &shown_holiday, bool wait) {
+  app_lock();
+  clk.show = settings.clock && clock_valid();
+  bool holidays = settings.holidays;
+  HolidayContext hctx;
+  static Birthday bdays[MAX_BIRTHDAYS];
+  for (int i = 0; i < MAX_BIRTHDAYS; i++) bdays[i] = settings.birthdays[i];
+  hctx.birthdays = bdays;
+  hctx.n_birthdays = MAX_BIRTHDAYS;
+  hctx.south = settings.lat < 0;
+  app_unlock();
+  int minute = -1;
+  time_t now = time(nullptr) + wx.utc_offset;
+  struct tm t; gmtime_r(&now, &t);
+  int led = current_led();
+  if (clk.show) {
+    clk.hour = t.tm_hour; clk.minute = t.tm_min;
+    minute = t.tm_hour * 60 + t.tm_min;
+  }
+  bool dated = clock_valid();
+  clk.year = dated ? t.tm_year + 1900 : 0;
+  clk.month = dated ? t.tm_mon + 1 : 0;
+  clk.day = dated ? t.tm_mday : 0;
+  Holiday hol = holidays && dated ? holiday_for(clk.year, clk.month, clk.day, hctx) : Holiday{HOL_NONE, "", "", 0};
+  uint32_t hol_key = fnv1a(String(hol.id) + '|' + hol.greeting + '|' + hol.quip + '|' + hol.arg);  // fits RTC memory
+  if (hol_key != shown_holiday) full = true;  // e.g. Christmas Eve -> Day, a new Hanukkah candle
+  if (!full && !(clk.show && minute != shown_minute)) return 0;
+  logf("[%lus] draw %02d:%02d %s\n", millis() / 1000, clk.hour, clk.minute, full ? "full" : "fast");
+  render(*canvas, wx, place, clk, &hol);
+  tag.lock();
+  bool ok = tag.show(*canvas, !full, led, false, wait);
+  tag.unlock();
+  if (esp_led != ESP_LED_INSTALLING) esp_led = ok ? ESP_LED_OFF : ESP_LED_TAG_ERROR;
+  app_lock();
+  status.tag_ok = ok;
+  status.tag_info = tag.info();
+  status.led = led;
+  if (ok) {
+    memcpy(preview[0], canvas->black, EpdCanvas::PLANE);
+    memcpy(preview[1], canvas->red, EpdCanvas::PLANE);
+    preview_version++;
+    (full ? status.last_full : status.last_fast) = millis();
+  } else {
+    status.last_error = "Tag not responding - reboot the ESP32 to reinstall the tag firmware";
+  }
+  app_unlock();
+  if (!ok) return -1;
+  shown_minute = minute;
+  shown_holiday = hol_key;
+  return 1;
+}
+
+// ---- deep sleep ----
+// State that survives deep sleep (RTC memory). Times are time() seconds, which keep running.
+static const uint32_t RTC_MAGIC = 0x57455431;
+struct RtcState {
+  uint32_t magic;
+  Weather wx;
+  bool have;
+  char place[48];
+  Clock clk;
+  int shown_minute;
+  uint32_t shown_holiday;  // hash of the holiday content on the display
+  time_t last_fetch_try, last_ok, busy_until;  // busy_until: the tag is doing a full refresh
+  uint32_t fetch_wait_s;
+  bool server_fail, wifi_fail;
+  TagState tag;
+  uint16_t ticks, draw_fails;  // since the last status report
+};
+RTC_DATA_ATTR static RtcState rtc;
+
+static bool ready_to_sleep() {
+  app_lock();
+  bool power_save = settings.power_save;
+  app_unlock();
+  return power_save && millis() - awake_since >= AWAKE_WINDOW_S * 1000UL && !tag_fw && tag_action == TAG_NONE &&
+         preview_holiday < 0 && !msg_pending && !request_full && !ota_active && !Update.isRunning();
+}
+
+// Sleep until the next clock minute (or the next weather fetch if the clock is off), never while
+// the tag is still busy with a full refresh. The BOOT button wakes it up for the settings page.
+[[noreturn]] static void deep_sleep() {
+  time_t now = time(nullptr);
+  long secs;
+  if (settings.clock && clock_valid()) secs = 60 - now % 60;
+  else secs = max(60L, (long)rtc.fetch_wait_s - (long)(now - rtc.last_fetch_try));
+  if (rtc.busy_until > now) secs = max(secs, (long)(rtc.busy_until - now));
+  logf("sleep %ld s\n", secs);
+  esp_led = ESP_LED_OFF;
+  if (STATUS_LED_PIN >= 0) neopixelWrite(STATUS_LED_PIN, 0, 0, 0);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  swire_prepare_sleep();
+  esp_sleep_enable_timer_wakeup(secs * 1000000ULL + 1500000ULL);  // 1.5 s past the minute: the RTC timer drifts
+  rtc_gpio_pullup_en((gpio_num_t)WAKE_BUTTON_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)WAKE_BUTTON_PIN);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_BUTTON_PIN, 0);
+  esp_deep_sleep_start();
+}
+
+// A timer wake-up from deep sleep: redraw the clock, fetch the weather if due, sleep again.
+// Wi-Fi is only switched on for the fetch; the display is the only thing that changes.
+[[noreturn]] static void tick() {
+  mtx = xSemaphoreCreateMutex();
+  swire_begin();
+  tag.begin(TAG_RX_PIN, TAG_TX_PIN);
+  tag.set_state(rtc.tag);
+  canvas = new EpdCanvas();
+  scanvas = new EpdCanvas();
+  settings_load(settings);
+  sun_info = &rtc.wx;
+  time_t now = time(nullptr);
+  if (rtc.busy_until > now + 1) deep_sleep();  // woke too early: the tag is still refreshing
+  bool full = false;
+  String before_wifi;
+  if (!clock_valid() || now - rtc.last_fetch_try >= (time_t)rtc.fetch_wait_s) {
+    tag.ping(&before_wifi);  // diagnostics: the tag's state before the radio starts
+    before_wifi.replace("OK P BWR213 ", "");
+    WiFi.mode(WIFI_STA);
+    WiFi.setHostname(settings.hostname.c_str());
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    for (int i = 0; i < 60 && !wifi_up(); i++) delay(200);
+    rtc.last_fetch_try = time(nullptr);
+    rtc.fetch_wait_s = RETRY_MINUTES * 60;
+    rtc.wifi_fail = !wifi_up();
+    if (wifi_up()) {
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      for (int i = 0; i < 20 && !clock_valid(); i++) delay(100);
+      Weather nw;
+      String np;
+      if (fetch(nw, np)) {
+        rtc.wx = nw;
+        strlcpy(rtc.place, np.c_str(), sizeof rtc.place);
+        time_t lt = time(nullptr) + nw.utc_offset;
+        struct tm t; gmtime_r(&lt, &t);
+        rtc.clk.upd_hour = t.tm_hour;
+        rtc.clk.upd_min = t.tm_min;
+        rtc.clk.stale = false;
+        rtc.last_ok = time(nullptr);
+        rtc.fetch_wait_s = max(settings.weather_minutes, 1) * 60;
+        rtc.server_fail = false;
+        full = true;
+      } else {
+        rtc.server_fail = true;
+        rtc.clk.stale = time(nullptr) - rtc.last_ok > 3L * max(settings.weather_minutes, 5) * 60;
+      }
+    }
+  }
+  if (rtc.wifi_fail) flash_red(1);  // same codes as when awake, once per wake-up
+  else if (rtc.server_fail) flash_red(2);
+  now = time(nullptr);
+  if (settings.clock && clock_valid() && now % 60 > 50) delay((60 - now % 60) * 1000 + 200);  // woke early
+  String place(rtc.place);
+  int r = draw_weather(rtc.wx, place, rtc.clk, full, rtc.shown_minute, rtc.shown_holiday, false);
+  if (r > 0) rtc.busy_until = time(nullptr) + (full ? 16 : 3);
+  rtc.ticks++;
+  if (r < 0) rtc.draw_fails++;
+  if (wifi_up()) {  // status report for the local network: udp port 47000 (see README)
+    WiFiUDP udp;
+    String msg = String("hanshow-weather v" FW_VERSION " ") + WiFi.localIP().toString() + " wakeups=" + rtc.ticks +
+                 " draw_fails=" + rtc.draw_fails + " weather=" + (rtc.server_fail ? "FAIL" : "ok") + " tag=" + tag.info() +
+                 " before_wifi=[" + before_wifi + "] hard_resets=" + tag.state().hard_resets +
+                 " pm25=" + String(rtc.wx.pm25, 1) + " air=" + air_status;
+    udp.beginPacket(IPAddress(255, 255, 255, 255), 47000);
+    udp.print(msg);
+    udp.endPacket();
+    delay(20);
+    rtc.ticks = rtc.draw_fails = 0;
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  rtc.tag = tag.state();
+  deep_sleep();
+}
+
 static void worker(void *) {
   Weather wx;
   String place;
   bool have = false;
   uint32_t fetch_at = 0, fetch_wait = 0;  // next fetch due when millis() - fetch_at >= fetch_wait (wrap-safe)
   int shown_minute = -1;
-  String shown_holiday = "-";  // holiday content on the display: any change needs a full refresh (red)
+  uint32_t shown_holiday = 0;  // hash of the holiday content on the display: a change needs a full refresh (red)
   Clock clk = {};
   uint32_t wifi_down_since = millis(), last_flash = 0, last_ok = 0, last_wifi_kick = millis();
   bool wifi_screen = false, server_fail = false, server_screen = false;
@@ -413,53 +608,26 @@ static void worker(void *) {
       full = true;
     }
     if (have && !holding) {
-      app_lock();
-      clk.show = settings.clock && clock_valid();
-      bool holidays = settings.holidays;
-      HolidayContext hctx;
-      static Birthday bdays[MAX_BIRTHDAYS];
-      for (int i = 0; i < MAX_BIRTHDAYS; i++) bdays[i] = settings.birthdays[i];
-      hctx.birthdays = bdays;
-      hctx.n_birthdays = MAX_BIRTHDAYS;
-      hctx.south = settings.lat < 0;
-      app_unlock();
-      int minute = -1;
-      time_t now = time(nullptr) + wx.utc_offset;
-      struct tm t; gmtime_r(&now, &t);
-      int led = current_led();
-      if (clk.show) {
-        clk.hour = t.tm_hour; clk.minute = t.tm_min;
-        minute = t.tm_hour * 60 + t.tm_min;
-      }
-      bool dated = clock_valid();
-      clk.year = dated ? t.tm_year + 1900 : 0;
-      clk.month = dated ? t.tm_mon + 1 : 0;
-      clk.day = dated ? t.tm_mday : 0;
-      Holiday hol = holidays && dated ? holiday_for(clk.year, clk.month, clk.day, hctx) : Holiday{HOL_NONE, "", "", 0};
-      String hol_key = String(hol.id) + '|' + hol.greeting + '|' + hol.quip + '|' + hol.arg;
-      if (hol_key != shown_holiday) full = true;  // e.g. Christmas Eve -> Day, a new Hanukkah candle
-      if (full || (clk.show && minute != shown_minute)) {
-        logf("[%lus] draw %02d:%02d %s\n", millis() / 1000, clk.hour, clk.minute, full ? "full" : "fast");
-        render(*canvas, wx, place, clk, &hol);
-        tag.lock();
-        bool ok = tag.show(*canvas, !full, led);
-        tag.unlock();
-        if (esp_led != ESP_LED_INSTALLING) esp_led = ok ? ESP_LED_OFF : ESP_LED_TAG_ERROR;
-        app_lock();
-        status.tag_ok = ok;
-        status.tag_info = tag.info();
-        status.led = led;
-        if (ok) {
-          memcpy(preview[0], canvas->black, EpdCanvas::PLANE);
-          memcpy(preview[1], canvas->red, EpdCanvas::PLANE);
-          preview_version++;
-          (full ? status.last_full : status.last_fast) = millis();
-        } else {
-          status.last_error = "Tag not responding - reboot the ESP32 to reinstall the tag firmware";
-        }
-        app_unlock();
-        if (ok) { shown_minute = minute; shown_holiday = hol_key; }
-        else if (full) { fetch_at = millis(); fetch_wait = RETRY_MINUTES * 60000UL; }
+      int r = draw_weather(wx, place, clk, full, shown_minute, shown_holiday, true);
+      if (r < 0 && full) { fetch_at = millis(); fetch_wait = RETRY_MINUTES * 60000UL; }
+      if (ready_to_sleep()) {  // nobody's using the settings page: hand over to deep sleep
+        time_t now = time(nullptr);
+        rtc.wx = wx;
+        rtc.have = true;
+        strlcpy(rtc.place, place.c_str(), sizeof rtc.place);
+        rtc.clk = clk;
+        rtc.shown_minute = shown_minute;
+        rtc.shown_holiday = shown_holiday;
+        rtc.last_fetch_try = now - (millis() - fetch_at) / 1000;
+        rtc.fetch_wait_s = fetch_wait / 1000;
+        rtc.last_ok = now - (millis() - last_ok) / 1000;
+        rtc.busy_until = 0;
+        rtc.server_fail = server_fail;
+        rtc.wifi_fail = false;
+        rtc.tag = tag.state();
+        rtc.ticks = rtc.draw_fails = 0;
+        rtc.magic = RTC_MAGIC;
+        deep_sleep();
       }
     }
     delay(500);
@@ -467,11 +635,18 @@ static void worker(void *) {
 }
 
 void setup() {
+  setCpuFrequencyMhz(80);  // plenty for this job, and roughly halves the CPU's draw
+  esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+  if (wake == ESP_SLEEP_WAKEUP_TIMER && rtc.magic == RTC_MAGIC) tick();  // clock update, then back to sleep
+  bool button = wake == ESP_SLEEP_WAKEUP_EXT0;                            // BOOT button: settings page wanted
+  awake_since = millis();
   Serial.begin(115200);
   Serial.setTxTimeoutMs(0);  // never stall on logging when no USB host is reading
   mtx = xSemaphoreCreateMutex();
   swire_begin();
   tag.begin(TAG_RX_PIN, TAG_TX_PIN);
+  if (rtc.magic == RTC_MAGIC) tag.set_state(rtc.tag);  // woke from deep sleep: we know the tag's screen
+  rtc.magic = 0;
   canvas = new EpdCanvas();
   scanvas = new EpdCanvas();
   if (STATUS_LED_PIN >= 0) xTaskCreatePinnedToCore(esp_led_task, "esp_led", 2048, nullptr, 1, nullptr, 0);
@@ -485,8 +660,9 @@ void setup() {
   WiFi.setHostname(settings.hostname.c_str());
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);  // connects in the background
+  WiFi.setSleep(true);  // modem sleep between DTIM beacons (MAX_MODEM chokes firmware uploads)
   String note = provision_tag();
-  show_status({"Starting up...", "fw " FW_VERSION, note}, LED_DAY_PCT * 10);  // visible "it's on" blink
+  if (!button) show_status({"Starting up...", "fw " FW_VERSION, note}, LED_DAY_PCT * 10);  // visible "it's on" blink
   configTime(0, 0, "pool.ntp.org", "time.google.com");  // UTC; local offset comes from Open-Meteo
   web_begin();
   ArduinoOTA.setHostname(settings.hostname.c_str());
@@ -494,6 +670,8 @@ void setup() {
   if (*ADMIN_PASSWORD) ArduinoOTA.setPassword(ADMIN_PASSWORD);
   ArduinoOTA.setRebootOnSuccess(false);  // restart ourselves once the display says so
   ArduinoOTA.onStart([] {
+    ota_active = true;
+    esp_wifi_set_ps(WIFI_PS_NONE);  // full speed for the transfer
     logln("ota: esp32 update started");
     post_message({"Receiving new firmware", "for the ESP32...", "don't unplug"}, 600);
   });
@@ -503,6 +681,7 @@ void setup() {
     ESP.restart();
   });
   ArduinoOTA.onError([](ota_error_t e) {
+    ota_active = false;
     static const char *why[] = {"authentication failed", "begin failed", "connection lost", "receive failed", "end failed"};
     post_message({"ESP32 update FAILED:", e <= OTA_END_ERROR ? why[e] : "unknown error", "still running the old firmware"}, MESSAGE_HOLD_S);
   });
@@ -519,5 +698,5 @@ void loop() {
       case 'd': dump(); break;
     }
   }
-  delay(2);
+  delay(20);  // web requests are handled within 20 ms; the CPU idles in between
 }

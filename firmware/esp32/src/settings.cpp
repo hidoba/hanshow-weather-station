@@ -13,6 +13,7 @@ void settings_load(Settings &s) {
   s.clock = p.getBool("clock", DEFAULT_CLOCK);
   s.fahrenheit = p.getBool("fahr", DEFAULT_FAHRENHEIT);
   s.holidays = p.getBool("holidays", DEFAULT_HOLIDAYS);
+  s.power_save = p.getBool("psave", DEFAULT_POWER_SAVE);
   String b = p.getString("bdays", "");  // "name|month|day\n..."
   for (auto &bd : s.birthdays) bd = Birthday{"", 0, 0};
   for (int i = 0, pos = 0; i < MAX_BIRTHDAYS && pos < (int)b.length(); i++) {
@@ -39,6 +40,7 @@ void settings_save(const Settings &s) {
   p.putBool("clock", s.clock);
   p.putBool("fahr", s.fahrenheit);
   p.putBool("holidays", s.holidays);
+  p.putBool("psave", s.power_save);
   String b;
   for (auto &bd : s.birthdays)
     if (bd.name.length() && bd.month && bd.day) b += bd.name + "|" + bd.month + "|" + bd.day + "\n";

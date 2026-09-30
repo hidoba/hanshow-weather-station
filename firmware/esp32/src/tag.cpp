@@ -15,7 +15,17 @@ uint32_t EpdCanvas::hash() const {
   return (uint32_t)crc16(black, PLANE) << 16 | crc16(red, PLANE);
 }
 
+void Tag::wake() {
+  s_.updateBaudRate(9600);  // one 0x00 at 9600 baud: ~1 ms low, well past the tag's pad wake-up
+  s_.write((uint8_t)0);
+  s_.flush();
+  s_.updateBaudRate(115200);
+  delay(5);  // crystal start-up
+  while (s_.available()) s_.read();
+}
+
 String Tag::cmd(char c, const uint8_t *p, int n, uint32_t timeout_ms) {
+  if (!last_io_ || millis() - last_io_ > 150) wake();  // the tag suspends after 300 ms idle
   uint8_t hdr[5] = {0xA5, 0x5A, (uint8_t)c, (uint8_t)n, (uint8_t)(n >> 8)};
   uint16_t crc = crc16(p, n, crc16(hdr + 2, 3));
   while (s_.available()) s_.read();
@@ -25,14 +35,21 @@ String Tag::cmd(char c, const uint8_t *p, int n, uint32_t timeout_ms) {
   s_.write((uint8_t)(crc >> 8));
   String line;
   uint32_t t0 = millis();
+  last_io_ = millis();
+  if (!timeout_ms) {  // fire and forget: but make sure it's on the wire before we might sleep
+    s_.flush();
+    return "SENT";
+  }
   while (millis() - t0 < timeout_ms) {
     if (!s_.available()) { delay(1); continue; }
     char ch = s_.read();
     if (ch != '\n') { line += ch; continue; }
     line.trim();
+    last_io_ = millis();
     if (line.startsWith("OK") || line.startsWith("ER")) return line;
     line = "";  // boot chatter etc.
   }
+  last_io_ = 0;  // no answer: wake it again next time
   return "TIMEOUT";
 }
 
@@ -45,20 +62,21 @@ bool Tag::ping(String *info, int *refreshes) {
   return r.startsWith("OK P");
 }
 
-bool Tag::show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast) {
+bool Tag::show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast, bool wait) {
   uint32_t t0 = millis();
   int n = -1;
   bool alive = false;
   for (int i = 0; i < 10 && !(alive = ping(nullptr, &n)); i++) delay(300);  // tag may be booting
   if (!alive) {  // wedged: hard reset through NRST and give it one more chance
     logln("tag: not responding, resetting");
+    st_.hard_resets++;
     tag_hard_reset();
     delay(2000);
     for (int i = 0; i < 10 && !(alive = ping(nullptr, &n)); i++) delay(300);
   }
-  if (!alive) { logln("tag: not responding"); sent_valid_ = false; return false; }
-  if (n != expect_n_) {  // tag rebooted (or first contact): its planes and screen are unknown
-    sent_valid_ = false;
+  if (!alive) { logln("tag: not responding"); st_.valid = false; return false; }
+  if (n != st_.expect_n) {  // tag rebooted (or first contact): its planes and screen are unknown
+    st_.valid = false;
     if (!force_fast) fast = false;
   }
   const int CHUNK = 240;
@@ -68,7 +86,8 @@ bool Tag::show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast) {
   for (int pl = 0; pl < 2; pl++) {
     for (int off = 0; off < EpdCanvas::PLANE; off += CHUNK) {
       int len = min(CHUNK, EpdCanvas::PLANE - off);
-      if (sent_valid_ && !memcmp(sent_[pl] + off, planes[pl] + off, len)) continue;
+      uint16_t crc = crc16(planes[pl] + off, len);
+      if (st_.valid && st_.crc[pl][off / CHUNK] == crc) continue;
       buf[0] = pl; buf[1] = off; buf[2] = off >> 8;
       memcpy(buf + 3, planes[pl] + off, len);
       String r;
@@ -78,7 +97,7 @@ bool Tag::show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast) {
       }
       if (r != "OK W") {
         logf("tag: write failed pl=%d off=%d: %s\n", pl, off, r.c_str());
-        sent_valid_ = false;
+        st_.valid = false;
         return false;
       }
       sent++;
@@ -86,14 +105,15 @@ bool Tag::show(const EpdCanvas &c, bool fast, uint16_t led, bool force_fast) {
   }
   uint8_t dp[5] = {(uint8_t)(fast ? 1 : 0), FAST_RED_DRIVE, FAST_FRAMES, (uint8_t)led, (uint8_t)(led >> 8)};
   uint32_t t1 = millis();
-  String r = cmd('D', dp, sizeof dp, 40000);
+  String r = cmd('D', dp, sizeof dp, wait ? 40000 : 0);
   logf("tag: %s refresh, %d chunks (%lu ms), refresh %lu ms: %s\n", fast ? "fast" : "full", sent,
                 t1 - t0, millis() - t1, r.c_str());
-  if (!r.startsWith("OK D")) { sent_valid_ = false; return false; }
-  memcpy(sent_[0], c.black, EpdCanvas::PLANE);
-  memcpy(sent_[1], c.red, EpdCanvas::PLANE);
-  sent_valid_ = true;
-  expect_n_ = n + 1;
+  if (wait && !r.startsWith("OK D")) { st_.valid = false; return false; }
+  for (int pl = 0; pl < 2; pl++)
+    for (int off = 0; off < EpdCanvas::PLANE; off += CHUNK)
+      st_.crc[pl][off / CHUNK] = crc16(planes[pl] + off, min(CHUNK, EpdCanvas::PLANE - off));
+  st_.valid = true;
+  st_.expect_n = n + 1;
   return true;
 }
 
@@ -114,8 +134,8 @@ static uint32_t crc32(const uint8_t *p, size_t n) {
 bool Tag::update_firmware(const uint8_t *fw, size_t n, String &msg, void (*progress)(int)) {
   if (n < 16 || memcmp(fw + 8, "KNLT", 4) != 0) { msg = "not a Telink firmware image"; return false; }
   if (!ping()) { msg = "tag not responding"; return false; }
-  sent_valid_ = false;  // the tag reboots afterwards; resend everything
-  expect_n_ = -1;
+  st_.valid = false;  // the tag reboots afterwards; resend everything
+  st_.expect_n = -1;
   uint32_t crc = crc32(fw, n);
   uint8_t hdr[8] = {(uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24),
                     (uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};

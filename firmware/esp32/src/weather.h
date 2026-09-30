@@ -32,3 +32,4 @@ struct Place {
 bool geocode(const String &query, Place &out);  // Open-Meteo geocoding
 bool fetch_weather(float lat, float lon, bool fahrenheit, Weather &w);
 bool fetch_air(float lat, float lon, Weather &w);
+extern String air_status;  // result of the last air-quality request (diagnostics)

@@ -2,6 +2,7 @@
 // see firmware/tag/LICENSE-ATC_TLSR_Paper.
 #include "swire.h"
 #include "config.h"
+#include <driver/gpio.h>
 
 static HardwareSerial sws(2);
 
@@ -11,9 +12,29 @@ static void idle_high() {
 }
 
 void swire_begin() {
-  pinMode(TAG_NRST_PIN, OUTPUT_OPEN_DRAIN);
+  // After deep sleep these pins are still held high. Configure them first and only then release
+  // the hold, otherwise NRST briefly falls back to an undriven input and can reset the tag.
+  pinMode(TAG_NRST_PIN, OUTPUT);  // driven high (low = reset)
   digitalWrite(TAG_NRST_PIN, HIGH);
   idle_high();
+  pinMode(TAG_TX_PIN, OUTPUT);    // UART idle level until Serial1 takes the pin over
+  digitalWrite(TAG_TX_PIN, HIGH);
+  gpio_hold_dis((gpio_num_t)TAG_NRST_PIN);
+  gpio_hold_dis((gpio_num_t)TAG_SWS_PIN);
+  gpio_hold_dis((gpio_num_t)TAG_TX_PIN);
+}
+
+void swire_prepare_sleep() {
+  digitalWrite(TAG_NRST_PIN, HIGH);
+  digitalWrite(TAG_SWS_PIN, HIGH);
+  Serial1.flush();                // let a just-sent command finish: end() discards pending bytes
+  Serial1.end();                  // hand the UART TX pin over: idle level is high
+  pinMode(TAG_TX_PIN, OUTPUT);
+  digitalWrite(TAG_TX_PIN, HIGH);
+  gpio_hold_en((gpio_num_t)TAG_NRST_PIN);  // floating lines reset / wake the tag
+  gpio_hold_en((gpio_num_t)TAG_SWS_PIN);
+  gpio_hold_en((gpio_num_t)TAG_TX_PIN);
+  gpio_deep_sleep_hold_en();
 }
 
 void tag_hard_reset() {

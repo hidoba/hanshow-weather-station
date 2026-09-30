@@ -35,6 +35,8 @@ over the chip's single-wire debug interface.
 - **Day strip:** yesterday, today and the next two days with icons, highs in red and lows in black
 - **Clock** updated every minute with a ~1.6 s non-flashing fast refresh; the full 3-colour
   refresh only runs when new weather arrives (default every 5 min)
+- **Low power:** deep sleep between updates, the settings page stays reachable for 5 minutes
+  after power-on, the BOOT button or opening it (see [Power](#power))
 - **°C / °F** (with km/h / mph)
 - **Holiday illustrations** for 23 holidays and fun days, plus **birthdays** you add in the
   settings (see [Holidays](#holidays))
@@ -151,8 +153,9 @@ Six wires go straight from the ESP32-S3-Zero to the pads; no USB-UART adapter is
 4. **Wire the tag** as above and power the ESP32 from any USB supply. On first boot the ESP32
    notices the tag doesn't speak its protocol and installs the bundled tag firmware over SWS
    (about 30 s). The tag then shows the splash, and the weather appears shortly after.
-5. **Open `http://weather.local`** (or the ESP32's IP), log in as `admin` with your
-   `ADMIN_PASSWORD`, and set your city.
+5. **Open `http://weather.local`** (or the ESP32's IP) within 5 minutes of powering it on, log in
+   as `admin` with your `ADMIN_PASSWORD`, and set your city. Later, press **BOOT** on the ESP32
+   (or power-cycle it) to reach the page again; see [Power](#power).
 
 From then on, everything can be updated over Wi-Fi.
 
@@ -183,6 +186,27 @@ with a full refresh.
 All LED signals except the power-on blink follow the same day/night brightness (1 % at night →
 20 % by day), so a Wi-Fi outage at night won't light up the room. If the local time or sunset
 isn't known yet (e.g. it booted without Wi-Fi), the night level is used.
+
+## Power
+
+Power saving is on by default (switch it off on the settings page to keep everything always on):
+
+- The **settings page is reachable for 5 minutes** after power-on, after pressing the **BOOT**
+  button on the ESP32-S3-Zero, or after the page was last opened (its own auto-refresh doesn't
+  count). The status table shows the countdown.
+- After that the ESP32 **deep-sleeps**. It wakes once a minute to redraw the clock over the
+  serial link with Wi-Fi off (about a second awake), and connects to Wi-Fi only to fetch the
+  weather (default every 5 minutes). Full refreshes are started without waiting for them to
+  finish, since the tag completes them on its own.
+- The **tag suspends** 300 ms after the last serial message and wakes on a pulse from the ESP32.
+- While awake: 80 MHz CPU, Wi-Fi modem sleep, and power saving is switched off only while a
+  firmware update is being received.
+- During each weather wake-up the ESP32 broadcasts a one-line status report on UDP port 47000
+  (wake-ups since the last report, draw failures, weather ok/fail, tag version and counters),
+  e.g. `nc -ulk 47000` to watch it.
+
+On a power bank, note that many banks switch off below ~50–100 mA; the station draws far less
+than that most of the time, so use a bank with an always-on / low-current mode or a USB charger.
 
 ## Security
 

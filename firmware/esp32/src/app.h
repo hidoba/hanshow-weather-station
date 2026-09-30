@@ -25,6 +25,8 @@ extern volatile bool request_full;            // set by the web page
 extern uint8_t *volatile tag_fw;              // pending tag firmware image (heap), set by the web page
 extern volatile size_t tag_fw_len;
 extern volatile bool tag_fw_sws;
+extern volatile uint32_t awake_since;          // millis() of power-on / wake button / last page open
+extern volatile bool ota_active;               // an ESP32 update is being received
 extern volatile int preview_holiday;           // HolidayId to show for a minute (-1 = none), set by the web page              // flash via SWS (recovery) instead of the UART link
 enum TagAction { TAG_NONE, TAG_RESET, TAG_SWS_TEST, TAG_DEMO_WIFI, TAG_DEMO_SERVER };
 extern volatile int tag_action;               // set by the web page

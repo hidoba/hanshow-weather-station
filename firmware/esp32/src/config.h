@@ -1,19 +1,20 @@
 #pragma once
 // Defaults; everything here except the pins can be changed on the settings web page.
-#define FW_VERSION "1.20"
+#define FW_VERSION "1.26"
 
 #define DEFAULT_CITY "Hong Kong"
 #define DEFAULT_HOSTNAME "weather"     // -> http://weather.local
 #define DEFAULT_WEATHER_MINUTES 5      // full (flashing) refresh happens with each weather update
 #define DEFAULT_CLOCK true             // per-minute clock via fast refresh
 #define DEFAULT_FAHRENHEIT false
+#define DEFAULT_POWER_SAVE true      // deep sleep between clock updates (see AWAKE_WINDOW_S)
 #define DEFAULT_HOLIDAYS true         // holiday illustrations instead of the curve on special days
 #define MAX_BIRTHDAYS 8               // birthdays entered on the settings page
 #define RETRY_MINUTES 2                // after a failed fetch
 
 #define TAG_RX_PIN 44                  // <- tag TXD
 #define TAG_TX_PIN 43                  // -> tag RXD
-#define TAG_NRST_PIN 12                // -> tag NRST (open drain, low = reset)
+#define TAG_NRST_PIN 12                // -> tag NRST (driven high, low = reset)
 #define TAG_SWS_PIN 10                 // -> tag SWS (recovery flashing; held high when idle)
 
 // Fast (clock) refresh waveform for red pixels: phase-A LUT byte and length in frames.
@@ -43,3 +44,9 @@
 #define STATUS_LED_PIN 21
 // How long an error/info message stays on the display before the weather comes back.
 #define MESSAGE_HOLD_S 60
+
+// Power saving: the settings page stays reachable for AWAKE_WINDOW_S after power-on, after the
+// BOOT button wakes it, or after the page was last opened. Then the ESP32 deep-sleeps, waking
+// once a minute for the clock (Wi-Fi off) and connecting only to fetch the weather.
+#define AWAKE_WINDOW_S 300
+#define WAKE_BUTTON_PIN 0              // BOOT button on the ESP32-S3-Zero (RTC GPIO, active low)

@@ -11,6 +11,7 @@ struct Settings {
   bool clock;
   bool fahrenheit;       // temperatures in F (and wind in mph)
   bool holidays;          // holiday illustrations on special days
+  bool power_save;        // deep sleep when nobody uses the settings page
   Birthday birthdays[MAX_BIRTHDAYS];  // entered on the settings page, stored only on the device
   String hostname;
 };
