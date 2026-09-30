@@ -1,6 +1,6 @@
 #pragma once
 // Defaults; everything here except the pins can be changed on the settings web page.
-#define FW_VERSION "1.19"
+#define FW_VERSION "1.20"
 
 #define DEFAULT_CITY "Hong Kong"
 #define DEFAULT_HOSTNAME "weather"     // -> http://weather.local

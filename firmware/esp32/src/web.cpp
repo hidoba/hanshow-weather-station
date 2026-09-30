@@ -60,7 +60,8 @@ input[type=text],input[type=number],select{width:100%;box-sizing:border-box;padd
 button{flex:1;padding:10px;font-size:1em;border:0;border-radius:6px;background:#c62828;color:#fff;cursor:pointer}
 button.sec{background:#444}
 .muted{color:#777;font-size:.85em}
-.bd{display:flex;gap:6px;margin:3px 0}.bd input{flex:2}.bd select{flex:1;width:auto}.err{color:#c62828;font-weight:600}
+.bd{display:flex;gap:6px;margin:3px 0}.bd input{flex:2}.bd select{flex:1;width:auto}
+.pv select{flex:1;width:auto}.pv button{flex:0 0 auto;white-space:nowrap}.err{color:#c62828;font-weight:600}
 td{padding:2px 12px 2px 0}
 </style></head><body>
 <h1>Weather display</h1>
@@ -76,7 +77,7 @@ td{padding:2px 12px 2px 0}
 <label><input type="checkbox" name="holidays" %HOLIDAYS%> Holidays: an illustration instead of the temperature curve on special days</label>
 <label>Birthdays (shown on the day, before any other holiday)</label>
 %BIRTHDAYS%
-<div class="row" style="margin-top:6px"><select name="pid">%HOLIDAYOPTS%</select>
+<div class="row pv" style="margin-top:6px"><select name="pid">%HOLIDAYOPTS%</select>
 <button class="sec" type="submit" formaction="/holiday" formnovalidate>Preview on display</button></div>
 <label>Hostname</label><input type="text" name="host" value="%HOST%" pattern="[a-z0-9-]+">
 <div class="muted">This page: http://%HOST%.local</div>
