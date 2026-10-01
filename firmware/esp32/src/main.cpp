@@ -325,7 +325,10 @@ struct RtcState {
   TagState tag;
   uint16_t ticks, draw_fails;  // since the last status report
 };
-RTC_DATA_ATTR static RtcState rtc;
+// Raw storage: Weather has default member values, and a C++ constructor runs at *every* boot,
+// including each deep-sleep wake-up; it would reset PM2.5 and sunrise/sunset every minute.
+RTC_DATA_ATTR alignas(RtcState) static uint8_t rtc_mem[sizeof(RtcState)];
+static RtcState &rtc = *reinterpret_cast<RtcState *>(rtc_mem);
 
 static bool ready_to_sleep() {
   app_lock();
@@ -371,6 +374,7 @@ static bool ready_to_sleep() {
   if (rtc.busy_until > now + 1) deep_sleep();  // woke too early: the tag is still refreshing
   bool full = false;
   String before_wifi;
+  float pm_at_wake = rtc.wx.pm25;  // diagnostics: must survive the sleep, not be reset
   if (!clock_valid() || now - rtc.last_fetch_try >= (time_t)rtc.fetch_wait_s) {
     tag.ping(&before_wifi);  // diagnostics: the tag's state before the radio starts
     before_wifi.replace("OK P BWR213 ", "");
@@ -418,7 +422,7 @@ static bool ready_to_sleep() {
     String msg = String("hanshow-weather v" FW_VERSION " ") + WiFi.localIP().toString() + " wakeups=" + rtc.ticks +
                  " draw_fails=" + rtc.draw_fails + " weather=" + (rtc.server_fail ? "FAIL" : "ok") + " tag=" + tag.info() +
                  " before_wifi=[" + before_wifi + "] hard_resets=" + tag.state().hard_resets +
-                 " pm25=" + String(rtc.wx.pm25, 1) + " air=" + air_status;
+                 " pm25=" + String(rtc.wx.pm25, 1) + " pm25_at_wake=" + String(pm_at_wake, 1) + " air=" + air_status;
     udp.beginPacket(IPAddress(255, 255, 255, 255), 47000);
     udp.print(msg);
     udp.endPacket();
